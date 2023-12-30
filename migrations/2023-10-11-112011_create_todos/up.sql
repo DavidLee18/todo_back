@@ -1,0 +1,16 @@
+-- Your SQL goes here
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  username VARCHAR UNIQUE NOT NULL,
+  password_hash VARCHAR NOT NULL,
+  token VARCHAR
+);
+
+CREATE TABLE todos (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR NOT NULL,
+  content VARCHAR NOT NULL,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  added_date TIMESTAMP NOT NULL DEFAULT NOW(),
+  owner_id INTEGER NOT NULL REFERENCES users
+);
