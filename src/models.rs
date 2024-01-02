@@ -21,10 +21,11 @@ pub struct Todo {
 #[diesel(table_name = crate::schema::todos)]
 pub struct CreateTodo {
     pub title: String,
-    pub content: String
+    pub content: String,
+    pub owner_id: i32
 }
 
-#[derive(Queryable, Selectable, Identifiable)]
+#[derive(Queryable, Selectable, Identifiable, Clone)]
 #[diesel(table_name = crate::schema::users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct User {
@@ -44,5 +45,5 @@ pub struct CreateUser {
 #[derive(Serialize, Deserialize)]
 pub struct Claims {
     pub exp: usize,
-    pub username: String,
+    pub user_id: i32,
 }

@@ -1,10 +1,11 @@
 pub mod models;
 pub mod schema;
+pub mod middleware;
 
 use std::{collections::HashMap, env, time::Duration};
 
 use crate::models::Todo;
-use axum::{Router, Json, http::{StatusCode, Request}, extract::{State, Query}, routing::put, response::Response};
+use axum::{Router, Json, http::{StatusCode, Request}, extract::{State, Query}, routing::put, response::Response, middleware::from_fn_with_state};
 use deadpool_diesel::postgres::Pool;
 use diesel::{SelectableHelper, RunQueryDsl, QueryDsl, ExpressionMethods};
 use jsonwebtoken as jwt;
@@ -80,6 +81,7 @@ async fn main() {
                     tracing::error!("{}", error);
                 })
         )
+        .layer(from_fn_with_state(pool.clone(), crate::middleware::require_authentication))
         .with_state(pool);
 
     // run it
@@ -169,15 +171,15 @@ async fn delete_todo(State(pool): State<Pool>, Query(params): Query<HashMap<Stri
 
 /// Utility function for mapping any error into a `500 Internal Server Error`
 /// response.
-fn internal_error<E>(err: E) -> (StatusCode, String)
+pub fn internal_error<E>(err: E) -> (StatusCode, String)
 where
     E: std::error::Error,
 {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
-fn create_token(secret: &str, username: String) -> Result<String, (StatusCode, String)> {
-    let claims = Claims { username, exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize };
+pub fn create_token(secret: &str, user_id: i32) -> Result<String, (StatusCode, String)> {
+    let claims = Claims { user_id, exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize };
     let key = jwt::EncodingKey::from_secret(secret.as_bytes());
 
     jwt::encode(&jwt::Header::default(), &claims, &key)
@@ -185,6 +187,20 @@ fn create_token(secret: &str, username: String) -> Result<String, (StatusCode, S
 
 }
 
-fn verify_token(secret: &str, token: &str) -> Result<bool, (StatusCode, String)> {
-    unimplemented!()
+pub fn verify_token(secret: &str, token: &str) -> Result<i32, (StatusCode, String)> {
+    let key = jwt::DecodingKey::from_secret(secret.as_bytes());
+    let validation = jwt::Validation::new(jwt::Algorithm::HS256);
+    match jwt::decode::<Claims>(token, &key, &validation) {
+            Ok(claim) => Ok(claim.claims.user_id),
+            Err(error) => match error.kind() {
+                jsonwebtoken::errors::ErrorKind::InvalidToken
+                | jsonwebtoken::errors::ErrorKind::InvalidSignature
+                | jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                    Err((StatusCode::UNAUTHORIZED, String::from("not authenticated!")))
+                },
+                _ => {
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Error validating token: {:?}", error)))
+                }
+            }
+        }
 }
