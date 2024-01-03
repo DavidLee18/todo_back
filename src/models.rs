@@ -2,9 +2,8 @@ use std::time::SystemTime;
 
 use diesel::prelude::*;
 use serde::{Serialize, Deserialize};
-use utoipa::ToSchema;
 
-#[derive(Queryable, Selectable, Identifiable, Serialize, ToSchema, Associations)]
+#[derive(Queryable, Selectable, Identifiable, Serialize, Associations)]
 #[diesel(table_name = crate::schema::todos)]
 #[diesel(belongs_to(User, foreign_key = owner_id))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -17,15 +16,14 @@ pub struct Todo {
     pub owner_id: i32
 }
 
-#[derive(Insertable, Deserialize, ToSchema)]
+#[derive(Insertable, Deserialize)]
 #[diesel(table_name = crate::schema::todos)]
 pub struct CreateTodo {
     pub title: String,
-    pub content: String,
-    pub owner_id: i32
+    pub content: String
 }
 
-#[derive(Queryable, Selectable, Identifiable, Clone)]
+#[derive(Queryable, Selectable, Identifiable, Clone, Serialize)]
 #[diesel(table_name = crate::schema::users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct User {
@@ -46,4 +44,15 @@ pub struct CreateUser {
 pub struct Claims {
     pub exp: usize,
     pub user_id: i32,
+}
+
+#[derive(Deserialize)]
+pub struct QueryId {
+    pub id: i32
+}
+
+#[derive(Deserialize)]
+pub struct LoginForm {
+    pub username: String,
+    pub password_hash: String
 }

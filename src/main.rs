@@ -2,50 +2,17 @@ pub mod models;
 pub mod schema;
 pub mod middleware;
 
-use std::{collections::HashMap, env, time::Duration};
+use std::{env, time::Duration};
 
 use crate::models::Todo;
-use axum::{Router, Json, http::{StatusCode, Request}, extract::{State, Query}, routing::put, response::Response, middleware::from_fn_with_state};
+use axum::{Router, Json, http::{StatusCode, Request}, extract::{State, Query}, routing::{put, delete, post, get}, response::Response, middleware::from_fn_with_state, Extension};
 use deadpool_diesel::postgres::Pool;
-use diesel::{SelectableHelper, RunQueryDsl, QueryDsl, ExpressionMethods};
+use diesel::{SelectableHelper, RunQueryDsl, QueryDsl, ExpressionMethods, BoolExpressionMethods};
 use jsonwebtoken as jwt;
-use models::{CreateTodo, Claims};
+use models::{CreateTodo, Claims, User, QueryId, CreateUser, LoginForm};
 use tower_http::{trace::TraceLayer, classify::ServerErrorsFailureClass};
 use tracing::Span;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use utoipa::{OpenApi, Modify, openapi::security::{SecurityScheme, ApiKey, ApiKeyValue}};
-use utoipa_swagger_ui::SwaggerUi;
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        get_todos,
-        create_todo,
-        complete_todo,
-        delete_todo,
-    ),
-    components(
-        schemas(Todo, CreateTodo)
-    ),
-    modifiers(&SecurityAddon),
-    tags(
-        (name = "todo", description = "Todo items management API")
-    )
-)]
-struct ApiDoc;
-
-struct SecurityAddon;
-
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
-                "api_key",
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("todo_apikey"))),
-            )
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -61,14 +28,19 @@ async fn main() {
 
     // build our application with some routes
     let app = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route(
-            "/",
+            "/todo",
             put(create_todo)
             .get(get_todos)
             .post(complete_todo)
             .delete(delete_todo),
         )
+        .route("/users", delete(delete_user))
+        .route("/users/change_password", post(change_password))
+        .route("/users/logout", get(logout))
+        .layer(from_fn_with_state(pool.clone(), crate::middleware::require_authentication))
+        .route("/users", put(create_user).get(get_users))
+        .route("/users/login", post(login))
         .layer(
             TraceLayer::new_for_http()
                 .on_request(|req: &Request<_>, _span: &Span| {
@@ -81,7 +53,6 @@ async fn main() {
                     tracing::error!("{}", error);
                 })
         )
-        .layer(from_fn_with_state(pool.clone(), crate::middleware::require_authentication))
         .with_state(pool);
 
     // run it
@@ -90,17 +61,21 @@ async fn main() {
     axum::serve(listener, app.into_make_service()).await.unwrap();
 }
 
-#[utoipa::path(put, path="/", request_body = CreateTodo, responses(
-    (status = 201, body = Todo)
-))]
-async fn create_todo(State(pool): State<Pool>, Json(todo): Json<CreateTodo>) -> Result<(StatusCode, Json<Todo>), (StatusCode, String)> {
+// todo CRUD
+
+async fn create_todo(
+    State(pool): State<Pool>,
+    Extension(user): Extension<User>,
+    Json(todo): Json<CreateTodo>,
+) -> Result<(StatusCode, Json<Todo>), (StatusCode, String)> {
     let conn = pool.get().await.map_err(internal_error)?;
 
-    use crate::schema::todos;
+    use crate::schema::todos::dsl::*;
 
     let res = conn.interact(move |conn| 
-        diesel::insert_into(todos::table)
-        .values(&todo)
+
+        diesel::insert_into(todos)
+        .values((title.eq(todo.title), content.eq(todo.content), owner_id.eq(user.id)))
         .returning(Todo::as_returning())
         .get_result(conn)
     ).await
@@ -110,16 +85,17 @@ async fn create_todo(State(pool): State<Pool>, Json(todo): Json<CreateTodo>) -> 
     Ok((StatusCode::CREATED, Json(res)))
 }
 
-#[utoipa::path(get, path="/", responses(
-    (status = 200, body = [Todo])
-))]
-async fn get_todos(State(pool): State<Pool>) -> Result<(StatusCode, Json<Vec<Todo>>), (StatusCode, String)> {
+async fn get_todos(
+    State(pool): State<Pool>,
+    Extension(user): Extension<User>
+) -> Result<(StatusCode, Json<Vec<Todo>>), (StatusCode, String)> {
     let conn = pool.get().await.map_err(internal_error)?;
 
     use crate::schema::todos::dsl::*;
 
     let res = conn.interact(move |conn| 
         todos
+        .filter(owner_id.eq(user.id))
         .select(Todo::as_select())
         .load(conn)
     ).await
@@ -129,12 +105,12 @@ async fn get_todos(State(pool): State<Pool>) -> Result<(StatusCode, Json<Vec<Tod
     Ok((StatusCode::OK, Json(res)))
 }
 
-#[utoipa::path(post, path="/", params(("id" = String, Query,)), responses(
-    (status = 200, body = Todo)
-))]
-async fn complete_todo(State(pool): State<Pool>, Query(params): Query<HashMap<String, i32>>) -> Result<Json<Todo>, (StatusCode, String)> {
+async fn complete_todo(
+    State(pool): State<Pool>,
+    Extension(_user): Extension<User>,
+    Query(QueryId { id: req_id }): Query<QueryId>
+) -> Result<Json<Todo>, (StatusCode, String)> {
     let conn = pool.get().await.map_err(internal_error)?;
-    let req_id = *params.get("id").ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no param named \"id\".".to_string()))?;
 
     use crate::schema::todos::dsl::*;
 
@@ -150,12 +126,12 @@ async fn complete_todo(State(pool): State<Pool>, Query(params): Query<HashMap<St
     Ok(Json(res))
 }
 
-#[utoipa::path(delete, path="/", params(("id" = String, Query,)), responses(
-    (status = 200)
-))]
-async fn delete_todo(State(pool): State<Pool>, Query(params): Query<HashMap<String, i32>>) -> Result<(), (StatusCode, String)> {
+async fn delete_todo(
+    State(pool): State<Pool>,
+    Extension(_user): Extension<User>,
+    Query(QueryId { id: req_id }): Query<QueryId>
+) -> Result<(), (StatusCode, String)> {
     let conn = pool.get().await.map_err(internal_error)?;
-    let req_id = *params.get("id").ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no param named \"id\".".to_string()))?;
 
     use crate::schema::todos::dsl::*;
 
@@ -167,6 +143,141 @@ async fn delete_todo(State(pool): State<Pool>, Query(params): Query<HashMap<Stri
     .map_err(internal_error)?;
 
     Ok(())
+}
+
+async fn create_user(
+    State(pool): State<Pool>,
+    Json(user): Json<CreateUser>
+) -> Result<(StatusCode, Json<User>), (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+
+    let res_user = conn.interact(move |conn| 
+        diesel::insert_into(users)
+            .values(&user)
+            .returning(User::as_returning())
+            .get_result(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    Ok((StatusCode::CREATED, Json(res_user)))
+}
+
+async fn login(
+    State(pool): State<Pool>,
+    Json(form): Json<LoginForm>
+) -> Result<String, (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+    use diesel::OptionalExtension;
+
+    let user: User = conn.interact(|conn| 
+        users.filter(username.eq(form.username).and(password_hash.eq(form.password_hash)))
+            .select(User::as_select())
+            .first(conn)
+            .optional()
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?
+    .ok_or((StatusCode::UNAUTHORIZED, String::from("no user with specified username and password matched")))?;
+
+    let t = create_token(&env::var("JWT_SECRET").expect("loading .env file failed"), user.id)?;
+
+    let t2 = t.clone();
+
+    let _ = conn.interact(move |conn|
+        diesel::update(users.find(user.id))
+            .set(token.eq(Some(t)))
+            .execute(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    Ok(t2)
+}
+
+async fn change_password(
+    State(pool): State<Pool>,
+    Extension(user): Extension<User>,
+    Json(new_pw_hash): Json<String>
+) -> Result<(), (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+
+    let _ = conn.interact(move |conn|
+        diesel::update(users.find(user.id))
+            .set((password_hash.eq(new_pw_hash), token.eq::<Option<String>>(None)))
+            .execute(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    Ok(())
+}
+
+async fn logout(
+    State(pool): State<Pool>,
+    Extension(user): Extension<User>
+) -> Result<(), (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+
+    let _ = conn.interact(move |conn|
+        diesel::update(users.find(user.id))
+            .set(token.eq::<Option<String>>(None))
+            .execute(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    Ok(())
+}
+
+async fn delete_user(
+    State(pool): State<Pool>,
+    Extension(user): Extension<User>
+) -> Result<(), (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+
+    let _ = conn.interact(move |conn|
+        diesel::delete(users.find(user.id))
+            .execute(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    Ok(())
+}
+
+async fn get_users(
+    State(pool): State<Pool>
+) -> Result<Json<Vec<User>>, (StatusCode, String)> {
+    let conn = pool.get().await.map_err(internal_error)?;
+
+    use schema::users::dsl::*;
+
+    let mut res_users = conn.interact(|conn|
+        users
+            .select(User::as_select())
+            .get_results(conn)
+    ).await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    for u in &mut res_users {
+        if let Some(t) = &mut u.token {
+            *t = t.chars().map(|_| '*').collect();
+        }
+    }
+
+    Ok(Json(res_users))
 }
 
 /// Utility function for mapping any error into a `500 Internal Server Error`
